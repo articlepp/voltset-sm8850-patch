@@ -1,0 +1,200 @@
+--- voltset/app/src/main/assets/backend/voltset.sh	2026-11-24 18:33:20.730996016 +0800
++++ apkwork/assets/backend/voltset.sh	2026-11-24 20:51:30.294997430 +0800
+@@ -4,10 +4,35 @@
+ export PATH
+ umask 077
+ 
++# ---- SM8850 shim (added): init does not mount debugfs on this platform, so
++# ---- the qcom_voltage_adj driver node is unreachable. Re-exec once inside a
++# ---- private mount namespace where debugfs is mounted: the node is visible to
++# ---- this script only, and the mount never shows up in any other mount table.
++if [ -z "${VOLTSET_PRIVATE_NS:-}" ] && [ ! -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ]; then
++    if [ -n "${1:-}" ] && [ -r "$1/bin/vsetns" ]; then
++        mkdir -p /data/adb/voltset 2>/dev/null || :
++        cp -f "$1/bin/vsetns" /data/adb/voltset/vsetns 2>/dev/null || :
++        chmod 700 /data/adb/voltset/vsetns 2>/dev/null || :
++        if [ -x /data/adb/voltset/vsetns ]; then
++            VOLTSET_PRIVATE_NS=1
++            export VOLTSET_PRIVATE_NS
++            exec /data/adb/voltset/vsetns /system/bin/sh "$0" "$@"
++        fi
++    fi
++fi
++
+ bundle=$1
+ action=$2
+ shift 2
+ 
++# Last-resort fallback (upstream behaviour) if the private namespace path is unusable.
++transient_mount=0
++if [ ! -e /sys/kernel/debug/qcom_voltage_adj/get_overrides ]; then
++    if mount -t debugfs -o nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null; then
++        transient_mount=1
++    fi
++fi
++
+ root=/data/adb/voltset
+ persistent=$root/persistent
+ session=$root/session
+@@ -34,6 +59,9 @@
+ cleanup() {
+     rc=$?
+     trap - EXIT
++    if [ "${transient_mount:-0}" = 1 ]; then
++        umount /sys/kernel/debug 2>/dev/null || :
++    fi
+     unload_scmi || {
+         printf 'ERROR SCMI 读表模块卸载失败\n' >&2
+         rc=1
+@@ -236,6 +264,30 @@
+ case "$action" in
+     status)
+         [ "$#" = 0 ] || die "status 参数无效"
++
++        # SDAM is volatile: a hard reset drops the override and XBL falls back to
++        # set 1. Install (idempotently) a boot hook that replays the last applied
++        # set, so the voltage survives a hard reset without touching any partition.
++        hook_dir=/data/adb/service.d
++        if [ -d "$hook_dir" ]; then
++            hook=$hook_dir/99-voltset-bootapply.sh
++            {
++                printf '#!/system/bin/sh\n'
++                printf 'B=%s\n' "$bundle"
++                cat <<'HOOK'
++L=/data/adb/voltset/bootapply.log
++[ -f /data/adb/voltset/last-set ] || exit 0
++( n=0
++  while [ ! -f "$B/voltset.sh" ] && [ $n -lt 360 ]; do sleep 5; n=$((n+1)); done
++  if [ ! -f "$B/voltset.sh" ]; then echo "$(date '+%F %T') bundle unreachable: $B" >> "$L"; exit 1; fi
++  echo "$(date '+%F %T') replay: $(cat /data/adb/voltset/last-set)" >> "$L"
++  /system/bin/sh "$B/voltset.sh" "$B" bootapply >> "$L" 2>&1
++) >/dev/null 2>&1 &
++HOOK
++            } > "$hook.tmp" 2>/dev/null &&
++                mv -f "$hook.tmp" "$hook" 2>/dev/null &&
++                chmod 755 "$hook" 2>/dev/null || :
++        fi
+         soc_model=$(getprop ro.soc.model 2>/dev/null || printf 'unknown')
+         device_model=$(getprop ro.product.model 2>/dev/null || printf 'unknown')
+         device_name=$(getprop ro.product.device 2>/dev/null || printf 'unknown')
+@@ -283,6 +335,65 @@
+         fi
+ 
+         reg_7151=$(read_reg_7151 "$dbg")
++        # self-heal: the boot hook needs a target. Adopt the current SDAM set if it
++        # is not the stock one, otherwise fall back to the built-in default (6),
++        # which can be overridden by writing "cpuss global" to $persistent/default-set.
++        if [ ! -f "$persistent/last-set" ]; then
++            heal_cpuss=
++            heal_global=
++            if [ -n "${dbg:-}" ] && read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" 2>/dev/null; then
++                heal_cpuss=$cpuss_idx
++                heal_global=$global_idx
++            fi
++            if [ -n "$heal_cpuss" ] && [ "$heal_cpuss" != 1 ]; then
++                printf '%s %s\n' "$heal_cpuss" "$heal_global" > "$persistent/last-set" 2>/dev/null || :
++                : > "$persistent/last-set.from-user" 2>/dev/null || :
++            elif [ -r "$persistent/default-set" ]; then
++                read -r heal_cpuss heal_global < "$persistent/default-set" || :
++                case "${heal_cpuss:-x}" in [1-7]) ;; *) heal_cpuss=6 ;; esac
++                case "${heal_global:-x}" in [0-7]) ;; *) heal_global=6 ;; esac
++                printf '%s %s\n' "$heal_cpuss" "$heal_global" > "$persistent/last-set" 2>/dev/null || :
++            else
++                printf '6 6\n' > "$persistent/last-set" 2>/dev/null || :
++            fi
++        fi
++        # layer 2: repair at every app start - if SDAM drifted away from the
++        # remembered set (hard reset, another tool, XBL default), put it back.
++        if [ -f "$persistent/last-set" ] && [ -f "$persistent/last-set.from-user" ] && [ -n "${dbg:-}" ]; then
++            want_cpuss=
++            want_global=
++            read -r want_cpuss want_global < "$persistent/last-set" 2>/dev/null || :
++            case "${want_cpuss:-x}" in [1-7]) ;; *) want_cpuss= ;; esac
++            case "${want_global:-x}" in [0-7]) ;; *) want_global= ;; esac
++            if [ -n "$want_cpuss" ] && [ -n "$want_global" ] &&
++               read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" 2>/dev/null; then
++                if [ "$cpuss_idx" != "$want_cpuss" ] || [ "$global_idx" != "$want_global" ]; then
++                    dec=$(( (want_cpuss << 4) | want_global ))
++                    printf '%s\n' "$dec" > "$dbg/qcom_voltage_adj/set_overrides" 2>/dev/null || :
++                fi
++            fi
++        fi
++
++        # remote-support diagnostics: refreshed on every status call
++        if [ -d /sdcard/Download ]; then
++            {
++                printf 'time: %s\n' "$(date '+%F %T' 2>/dev/null)"
++                printf 'model: %s (%s)\n' "$(getprop ro.product.model 2>/dev/null)" "$(getprop ro.product.device 2>/dev/null)"
++                printf 'soc: %s\n' "$soc_model"
++                printf 'kernel: %s\n' "$(uname -r)"
++                printf 'page_size: %s\n' "$page_size"
++                printf 'voltage_adj_ko: %s\n' "$(ls /vendor/lib/modules 2>/dev/null | grep -c voltage_adj)"
++                printf 'voltage_adj_loaded: %s\n' "$(grep -c qcom_voltage_adj /proc/modules 2>/dev/null || printf 0)"
++                printf 'debugfs_mounts: %s\n' "$(awk '$3 == "debugfs" {n++} END {print n+0}' /proc/mounts 2>/dev/null)"
++                printf 'overrides: %s\n' "$(cat /sys/kernel/debug/qcom_voltage_adj/get_overrides 2>/dev/null | tr '\n' ' ')"
++                printf 'last_set: %s\n' "$(cat "$persistent/last-set" 2>/dev/null)"
++                printf 'hook: %s\n' "$([ -f /data/adb/service.d/99-voltset-bootapply.sh ] && printf yes || printf no)"
++                printf 'service_d: %s\n' "$([ -d /data/adb/service.d ] && printf yes || printf no)"
++                printf 'root_mgr: %s\n' "$([ -d /data/adb/ksu ] && printf KSU || { [ -d /data/adb/magisk ] && printf Magisk || printf unknown; })"
++                printf 'bootapply_log:\n'
++                tail -5 /data/adb/voltset/bootapply.log 2>/dev/null
++            } > /sdcard/Download/voltset-diag.txt 2>/dev/null || :
++        fi
+         printf 'REG_7151=%s\n' "$reg_7151"
+ 
+         if pdp_dev=$(find_pdp_cdb); then
+@@ -336,6 +447,45 @@
+         fi
+         ;;
+ 
++    bootapply)
++        [ "$#" = 0 ] || die "bootapply 参数无效"
++        [ -r "$persistent/last-set" ] || exit 0
++        read -r want_cpuss want_global < "$persistent/last-set" || exit 0
++        case "${want_cpuss:-x}" in [1-7]) ;; *) exit 0 ;; esac
++        case "${want_global:-x}" in [0-7]) ;; *) exit 0 ;; esac
++        dbg=
++        n=0
++        while [ "$n" -lt 20 ]; do
++            if dbg=$(find_debugfs 2>/dev/null) && [ -r "$dbg/qcom_voltage_adj/get_overrides" ]; then
++                break
++            fi
++            dbg=
++            n=$((n+1))
++            sleep 1
++        done
++        [ -n "$dbg" ] || die "bootapply: 接口未就绪"
++        if read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides"; then
++            if [ "$cpuss_idx" = "$want_cpuss" ] && [ "$global_idx" = "$want_global" ]; then
++                printf 'BOOTAPPLY=already %s/%s\n' "$cpuss_idx" "$global_idx"
++                exit 0
++            fi
++        fi
++        dec=$(( (want_cpuss << 4) | want_global ))
++        try=0
++        while [ "$try" -lt 5 ]; do
++            printf '%s\n' "$dec" > "$dbg/qcom_voltage_adj/set_overrides" 2>/dev/null || :
++            if read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" 2>/dev/null &&
++               [ "$cpuss_idx" = "$want_cpuss" ] && [ "$global_idx" = "$want_global" ]; then
++                printf 'BOOTAPPLY=%s/%s\n' "$cpuss_idx" "$global_idx"
++                exit 0
++            fi
++            try=$((try+1))
++            sleep 2
++        done
++        printf 'BOOTAPPLY=FAILED want=%s/%s last=%s/%s\n' "$want_cpuss" "$want_global" "${cpuss_idx:-?}" "${global_idx:-?}"
++        die "bootapply: 写入后校验失败"
++        ;;
++
+     set_override)
+         [ "$#" = 3 ] || die "set_override 参数数量无效"
+         [ "$1" = "$boot" ] || die "启动 ID 已改变，请刷新状态后重试"
+@@ -360,6 +510,8 @@
+         read_overrides_indices "$dbg/qcom_voltage_adj/get_overrides" || die "写入后回读 get_overrides 失败"
+         [ "$cpuss_idx" = "$target_cpuss" ] && [ "$global_idx" = "$target_global" ] ||
+             die "写入校验失败：读回为 CPUSS=$cpuss_idx Global=$global_idx（期望 $target_cpuss/$target_global）"
++        printf '%s %s\n' "$target_cpuss" "$target_global" > "$persistent/last-set" 2>/dev/null || :
++        : > "$persistent/last-set.from-user" 2>/dev/null || :
+ 
+         reg_7151=$(read_reg_7151 "$dbg")
+         printf 'BOOT_ID=%s\n' "$boot"

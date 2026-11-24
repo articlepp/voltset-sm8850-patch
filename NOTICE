@@ -1,0 +1,16 @@
+VoltSet SM8850 patch
+====================
+
+This project contains a modified version of the backend script shipped with
+VoltSet (https://github.com/rfj53005-gif/VoltSet), which is licensed under the
+Apache License, Version 2.0.
+
+Modifications (2026-11):
+  * added a private-mount-namespace shim so qcom_voltage_adj is reachable on
+    devices whose init does not mount debugfs
+  * added last-set bookkeeping, boot replay hook, drift repair, write retries
+    and on-device diagnostics to the backend script
+
+Original copyright and license notices are retained in LICENSE.
+This project is not affiliated with Qualcomm, Xiaomi, Redmi, or the VoltSet
+upstream author.
