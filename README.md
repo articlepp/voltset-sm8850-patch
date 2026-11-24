@@ -10,6 +10,13 @@ your own risk.**
 
 ---
 
+## 从哪里看起
+
+1. **只想装**：去 Releases 下 APK，装前先看下面「前置条件」和「适用机型」
+2. **想知道原理**：读 [AI-HANDOFF.md](AI-HANDOFF.md)
+3. **想自己构建**：看「构建」一节，配合 `build.sh`
+4. **出问题了**：先看 [FAQ.md](FAQ.md)，仍无解就开 issue 并附诊断文件
+
 ## 问题是什么
 
 VoltSet（[上游](https://github.com/rfj53005-gif/VoltSet)）通过内核的 `qcom_voltage_adj`
