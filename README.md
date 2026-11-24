@@ -57,6 +57,19 @@ L3 会写入一个默认目标（Set 6）。如果没有 `last-set.from-user` �
 
 ---
 
+## 适用机型（Scope）
+
+| 项 | 范围 |
+|---|---|
+| SoC | **SM8850 / 骁龙 8 Elite Gen 5**（本项目只验证过这一代） |
+| 触发条件 | 内核**未挂载 debugfs**、但已加载 `qcom_voltage_adj.ko` 的机型 |
+| 实测机型 | REDMI K100 Pro Max（M098FE），内核 `6.12.69-android16-6-g0a1dc0413ec7` |
+| 可能适用 | 其它米系 SM8850 机型（同类内核裁剪）；**未验证**，请附诊断文件开 issue |
+| 明确不适用 | 其它 SoC；内核无 `qcom_voltage_adj.ko` 的机型；无 `service.d` 的 root 方案 |
+
+> 本项目不是"破解检测"，而是补上厂商 init 少做的一步（挂载 debugfs），
+> 让 VoltSet 原本就设计好的接口能正常访问。
+
 ## 前置条件（缺一不可）
 
 1. SoC 为 **SM8850**，且内核里有 `qcom_voltage_adj.ko`
