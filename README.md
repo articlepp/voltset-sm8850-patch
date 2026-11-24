@@ -1,4 +1,4 @@
-# VoltSet SM8850 patch — pass the compatibility check and keep your undervolt across reboots
+# VoltSet SM8850 Patch（米系 8e5 / 骁龙 8 Elite Gen 5 CPU 降压）— pass the compatibility check and keep your undervolt across reboots
 
 **TL;DR (English)** — On some SM8850 (Snapdragon 8 Elite Gen 5) devices, `init` never mounts
 debugfs, so VoltSet's `qcom_voltage_adj` compatibility check fails with `UNSUPPORTED`. This
